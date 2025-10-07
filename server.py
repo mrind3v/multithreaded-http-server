@@ -3,24 +3,43 @@ import argparse
 import os
 from datetime import datetime
 from email.utils import formatdate
+import json
+import time
+import random
 
 RESOURCES_DIR = os.path.join(os.path.dirname(__file__), 'resources')
 
 def parse_http_request(raw_request: str) -> dict:
+    """
+    Parses a raw HTTP request, now including the body.
+    """
     if not raw_request:
         return {}
-    lines = raw_request.split('\r\n')
+
+    try:
+        head, body = raw_request.split('\r\n\r\n', 1)
+    except ValueError:
+        head, body = raw_request, ""
+
+    lines = head.split('\r\n')
+    
     try:
         method, path, version = lines[0].split(' ')
     except ValueError:
         return {}
+
     headers = {}
     for line in lines[1:]:
-        if line == "":
-            break
         key, value = line.split(': ', 1)
         headers[key] = value
-    return {"method": method, "path": path, "version": version, "headers": headers}
+
+    return {
+        "method": method,
+        "path": path,
+        "version": version,
+        "headers": headers,
+        "body": body
+    }
 
 def get_content_type(file_path: str) -> (str, bool):
     ext = os.path.splitext(file_path)[1].lower()
@@ -29,19 +48,15 @@ def get_content_type(file_path: str) -> (str, bool):
     elif ext in ['.txt', '.png', '.jpg', '.jpeg']:
         return 'application/octet-stream', True
     else:
-        return None, False 
+        return None, False
 
 def build_http_response(status_code: int, status_message: str, headers: dict, body: bytes = b''):
-    """Constructs a full HTTP response."""
     response_line = f"HTTP/1.1 {status_code} {status_message}\r\n"
-    
     headers['Date'] = formatdate(timeval=None, localtime=False, usegmt=True)
     headers['Server'] = 'MyPythonHTTPServer'
     headers['Content-Length'] = str(len(body))
-    headers['Connection'] = 'close' 
-    
+    headers['Connection'] = 'close'
     header_lines = "".join([f"{k}: {v}\r\n" for k, v in headers.items()])
-    
     return response_line.encode('utf-8') + header_lines.encode('utf-8') + b"\r\n" + body
 
 def send_error_response(client_socket: socket.socket, status_code: int, status_message: str):
@@ -49,36 +64,62 @@ def send_error_response(client_socket: socket.socket, status_code: int, status_m
     client_socket.sendall(response)
 
 def handle_get_request(client_socket: socket.socket, request: dict):
-    """Handles a GET request by serving a file."""
     path = request['path']
-    if path == '/':
-        path = '/index.html' 
-
+    if path == '/': path = '/index.html'
     file_path = os.path.abspath(os.path.join(RESOURCES_DIR, path.lstrip('/')))
     if not file_path.startswith(RESOURCES_DIR):
         send_error_response(client_socket, 403, "Forbidden")
         return
-
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         send_error_response(client_socket, 404, "Not Found")
         return
-
     content_type, is_attachment = get_content_type(file_path)
     if content_type is None:
         send_error_response(client_socket, 415, "Unsupported Media Type")
         return
-
     with open(file_path, 'rb') as f:
         file_content = f.read()
-
     headers = {'Content-Type': content_type}
     if is_attachment:
         filename = os.path.basename(file_path)
         headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-
     response = build_http_response(200, "OK", headers, file_content)
     client_socket.sendall(response)
     print(f"--- Responded 200 OK for {path} ({len(file_content)} bytes) ---")
+
+
+def handle_post_request(client_socket: socket.socket, request: dict):
+    """Handles a POST request by saving JSON data to a file."""
+    if request['headers'].get('Content-Type') != 'application/json':
+        send_error_response(client_socket, 415, "Unsupported Media Type")
+        return
+
+    try:
+        json_data = json.loads(request['body'])
+    except json.JSONDecodeError:
+        send_error_response(client_socket, 400, "Bad Request")
+        return
+
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    random_id = random.randint(1000, 9999)
+    filename = f"upload_{timestamp}_{random_id}.json"
+    filepath = os.path.join(RESOURCES_DIR, 'uploads', filename)
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, indent=4)
+
+    response_body = {
+        "status": "success",
+        "message": "File created successfully",
+        "filepath": f"/uploads/{filename}"
+    }
+    response_body_bytes = json.dumps(response_body).encode('utf-8')
+    headers = {'Content-Type': 'application/json'}
+    
+    response = build_http_response(201, "Created", headers, response_body_bytes)
+    client_socket.sendall(response)
+    print(f"--- Responded 201 Created, saved to {filename} ---")
+
 
 def handle_connection(client_socket: socket.socket):
     try:
@@ -93,8 +134,7 @@ def handle_connection(client_socket: socket.socket):
         if request['method'] == 'GET':
             handle_get_request(client_socket, request)
         elif request['method'] == 'POST':
-            print("--- Handling POST request (placeholder) ---")
-            send_error_response(client_socket, 501, "Not Implemented") 
+            handle_post_request(client_socket, request) 
         else:
             send_error_response(client_socket, 405, "Method Not Allowed")
 
