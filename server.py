@@ -6,49 +6,57 @@ from email.utils import formatdate
 import json
 import time
 import random
+import threading
+import queue
 
 RESOURCES_DIR = os.path.join(os.path.dirname(__file__), 'resources')
 
-def parse_http_request(raw_request: str) -> dict:
-    """
-    Parses a raw HTTP request, now including the body.
-    """
-    if not raw_request:
-        return {}
+class ThreadPool:
+    def __init__(self, max_threads: int):
+        self.tasks = queue.Queue()
+        self.workers = []
+        for i in range(max_threads):
+            thread = threading.Thread(target=self._worker, name=f"Thread-{i+1}", daemon=True)
+            thread.start()
+            self.workers.append(thread)
 
+    def _worker(self):
+        while True:
+            try:
+                client_socket = self.tasks.get()
+                if client_socket is None: 
+                    break
+                print(f"[{threading.current_thread().name}] Handling new connection...")
+                handle_connection(client_socket)
+            finally:
+                self.tasks.task_done()
+
+    def add_task(self, task):
+        self.tasks.put(task)
+
+
+
+def parse_http_request(raw_request: str) -> dict:
+    if not raw_request: return {}
     try:
         head, body = raw_request.split('\r\n\r\n', 1)
     except ValueError:
         head, body = raw_request, ""
-
     lines = head.split('\r\n')
-    
     try:
         method, path, version = lines[0].split(' ')
-    except ValueError:
-        return {}
-
+    except ValueError: return {}
     headers = {}
     for line in lines[1:]:
         key, value = line.split(': ', 1)
         headers[key] = value
-
-    return {
-        "method": method,
-        "path": path,
-        "version": version,
-        "headers": headers,
-        "body": body
-    }
+    return {"method": method, "path": path, "version": version, "headers": headers, "body": body}
 
 def get_content_type(file_path: str) -> (str, bool):
     ext = os.path.splitext(file_path)[1].lower()
-    if ext == '.html':
-        return 'text/html; charset=utf-8', False
-    elif ext in ['.txt', '.png', '.jpg', '.jpeg']:
-        return 'application/octet-stream', True
-    else:
-        return None, False
+    if ext == '.html': return 'text/html; charset=utf-8', False
+    elif ext in ['.txt', '.png', '.jpg', '.jpeg']: return 'application/octet-stream', True
+    else: return None, False
 
 def build_http_response(status_code: int, status_message: str, headers: dict, body: bytes = b''):
     response_line = f"HTTP/1.1 {status_code} {status_message}\r\n"
@@ -64,6 +72,7 @@ def send_error_response(client_socket: socket.socket, status_code: int, status_m
     client_socket.sendall(response)
 
 def handle_get_request(client_socket: socket.socket, request: dict):
+    thread_name = threading.current_thread().name
     path = request['path']
     if path == '/': path = '/index.html'
     file_path = os.path.abspath(os.path.join(RESOURCES_DIR, path.lstrip('/')))
@@ -85,43 +94,33 @@ def handle_get_request(client_socket: socket.socket, request: dict):
         headers['Content-Disposition'] = f'attachment; filename="{filename}"'
     response = build_http_response(200, "OK", headers, file_content)
     client_socket.sendall(response)
-    print(f"--- Responded 200 OK for {path} ({len(file_content)} bytes) ---")
-
+    print(f"[{thread_name}] Responded 200 OK for {path} ({len(file_content)} bytes)")
 
 def handle_post_request(client_socket: socket.socket, request: dict):
-    """Handles a POST request by saving JSON data to a file."""
+    thread_name = threading.current_thread().name
     if request['headers'].get('Content-Type') != 'application/json':
         send_error_response(client_socket, 415, "Unsupported Media Type")
         return
-
     try:
         json_data = json.loads(request['body'])
     except json.JSONDecodeError:
         send_error_response(client_socket, 400, "Bad Request")
         return
-
     timestamp = time.strftime('%Y%m%d_%H%M%S')
     random_id = random.randint(1000, 9999)
     filename = f"upload_{timestamp}_{random_id}.json"
     filepath = os.path.join(RESOURCES_DIR, 'uploads', filename)
-
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(json_data, f, indent=4)
-
-    response_body = {
-        "status": "success",
-        "message": "File created successfully",
-        "filepath": f"/uploads/{filename}"
-    }
+    response_body = {"status": "success", "message": "File created successfully", "filepath": f"/uploads/{filename}"}
     response_body_bytes = json.dumps(response_body).encode('utf-8')
     headers = {'Content-Type': 'application/json'}
-    
     response = build_http_response(201, "Created", headers, response_body_bytes)
     client_socket.sendall(response)
-    print(f"--- Responded 201 Created, saved to {filename} ---")
-
+    print(f"[{thread_name}] Responded 201 Created, saved to {filename}")
 
 def handle_connection(client_socket: socket.socket):
+    thread_name = threading.current_thread().name
     try:
         raw_request_bytes = client_socket.recv(8192)
         if not raw_request_bytes: return
@@ -129,17 +128,17 @@ def handle_connection(client_socket: socket.socket):
         request = parse_http_request(raw_request)
         if not request: return
         
-        print(f"[Request] Method: {request['method']}, Path: {request['path']}")
+        print(f"[{thread_name}] Request: {request['method']} {request['path']}")
         
         if request['method'] == 'GET':
             handle_get_request(client_socket, request)
         elif request['method'] == 'POST':
-            handle_post_request(client_socket, request) 
+            handle_post_request(client_socket, request)
         else:
             send_error_response(client_socket, 405, "Method Not Allowed")
 
     except Exception as e:
-        print(f"Error handling connection: {e}")
+        print(f"[{thread_name}] Error handling connection: {e}")
     finally:
         client_socket.close()
 
@@ -149,18 +148,25 @@ def main():
     parser.add_argument("host", type=str, default="127.0.0.1", nargs='?', help="The host address the server will bind to (default: 127.0.0.1)")
     parser.add_argument("max_threads", type=int, default=10, nargs='?', help="The maximum number of threads in the pool (default: 10)")
     args = parser.parse_args()
+
+    thread_pool = ThreadPool(max_threads=args.max_threads)
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((args.host, args.port))
         server_socket.listen(50)
+        
         print(f"HTTP Server started on http://{args.host}:{args.port}")
-        print(f"Serving files from '{RESOURCES_DIR}' directory")
-        print(f"Press Ctrl+C to stop the server")
+        print(f"Thread pool size: {args.max_threads}")
+        print("Press Ctrl+C to stop the server")
+
         while True:
             try:
                 client_socket, client_address = server_socket.accept()
-                print(f"\nAccepted connection from {client_address[0]}:{client_address[1]}")
-                handle_connection(client_socket)
+                print(f"\n[MainThread] Accepted connection from {client_address[0]}:{client_address[1]}")
+                
+                thread_pool.add_task(client_socket)
+
             except KeyboardInterrupt:
                 print("\nServer is shutting down.")
                 break
